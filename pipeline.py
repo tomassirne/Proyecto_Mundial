@@ -1,9 +1,8 @@
 """
 Mundial 2026 · Pipeline de datos diario
 ========================================
-Fuentes:
-  - API-Football (plan pago): fixtures, match stats, lineups, player stats, top scorers
-  - football-data.org (gratis): standings (más confiable en esta API)
+Fuente única: API-Football (plan pago)
+  - fixtures, match stats, lineups, player stats, standings, top scorers
 
 Corre una vez por día vía GitHub Actions.
 Dependencias: pip install requests psycopg2-binary python-dotenv
@@ -20,15 +19,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── CONFIG ───────────────────────────────────────────────────
-API_FOOTBALL_KEY  = os.environ["API_FOOTBALL_KEY"]
-FOOTBALL_DATA_KEY = os.environ["FOOTBALL_DATA_KEY"]
-DB_URL            = os.environ["SUPABASE_DB_URL"]
+API_FOOTBALL_KEY = os.environ["API_FOOTBALL_KEY"]
+DB_URL           = os.environ["SUPABASE_DB_URL"]
 
 AF_BASE    = "https://v3.football.api-sports.io"
 AF_HEADERS = {"x-apisports-key": API_FOOTBALL_KEY}
-
-FD_BASE    = "https://api.football-data.org/v4"
-FD_HEADERS = {"X-Auth-Token": FOOTBALL_DATA_KEY}
 
 LEAGUE_ID = 1
 SEASON    = 2026
@@ -53,12 +48,6 @@ def af_get(endpoint: str, params: dict) -> dict:
     if data.get("errors"):
         log.warning(f"  Errors: {data['errors']}")
     return data
-
-def fd_get(path: str, params: dict = {}) -> dict:
-    """GET a football-data.org."""
-    resp = requests.get(f"{FD_BASE}/{path}", headers=FD_HEADERS, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
 
 def get_conn():
     return psycopg2.connect(DB_URL)
@@ -295,36 +284,32 @@ def fetch_player_stats(match_id: int) -> list:
     return rows
 
 
-# ── FETCH: STANDINGS (football-data.org) ─────────────────────
+# ── FETCH: STANDINGS (API-Football) ─────────────────────────
 
 def fetch_standings(today: date) -> list:
-    try:
-        data = fd_get("competitions/WC/standings")
-    except Exception as e:
-        log.warning(f"Standings fallido: {e}")
-        return []
-
+    data = af_get("standings", {"league": LEAGUE_ID, "season": SEASON})
     rows = []
-    for standing_group in data.get("standings", []):
-        group_name = standing_group.get("group", "").replace("GROUP_", "")
-        for entry in standing_group.get("table", []):
-            team = entry["team"]
-            rows.append({
-                "snapshot_date": today.isoformat(),
-                "group_name":    group_name,
-                "rank":          entry["position"],
-                "team_id":       team["id"],
-                "team_name":     team["name"],
-                "played":        entry["playedGames"],
-                "won":           entry["won"],
-                "drawn":         entry["draw"],
-                "lost":          entry["lost"],
-                "goals_for":     entry["goalsFor"],
-                "goals_against": entry["goalsAgainst"],
-                "goal_diff":     entry["goalDifference"],
-                "points":        entry["points"],
-                "form":          entry.get("form"),
-            })
+
+    for league_data in data.get("response", []):
+        for group in league_data.get("league", {}).get("standings", []):
+            for entry in group:
+                team = entry["team"]
+                rows.append({
+                    "snapshot_date": today.isoformat(),
+                    "group_name":    entry.get("group", "").replace("Group ", ""),
+                    "rank":          entry["rank"],
+                    "team_id":       team["id"],
+                    "team_name":     team["name"],
+                    "played":        entry["all"]["played"],
+                    "won":           entry["all"]["win"],
+                    "drawn":         entry["all"]["draw"],
+                    "lost":          entry["all"]["lose"],
+                    "goals_for":     entry["all"]["goals"]["for"],
+                    "goals_against": entry["all"]["goals"]["against"],
+                    "goal_diff":     entry["goalsDiff"],
+                    "points":        entry["points"],
+                    "form":          entry.get("form"),
+                })
 
     log.info(f"Standings: {len(rows)} equipos")
     return rows
