@@ -284,6 +284,35 @@ def fetch_player_stats(match_id: int) -> list:
     return rows
 
 
+# ── FETCH: EVENTS ────────────────────────────────────────────
+
+def fetch_events(match_id: int) -> list:
+    """
+    Cronología del partido: goles, tarjetas, sustituciones.
+    Un evento por fila.
+    """
+    data = af_get("fixtures/events", {"fixture": match_id})
+    rows = []
+
+    for ev in data.get("response", []):
+        rows.append({
+            "match_id":      match_id,
+            "elapsed":       safe_int(ev["time"]["elapsed"]),
+            "elapsed_extra": safe_int(ev["time"].get("extra")),
+            "team_id":       ev["team"]["id"],
+            "team_name":     ev["team"]["name"],
+            "player_id":     ev["player"]["id"],
+            "player_name":   ev["player"]["name"],
+            "assist_id":     ev["assist"]["id"],
+            "assist_name":   ev["assist"]["name"],
+            "event_type":    ev["type"],
+            "detail":        ev["detail"],
+            "comments":      ev.get("comments"),
+        })
+
+    return rows
+
+
 # ── FETCH: STANDINGS (API-Football) ─────────────────────────
 
 def fetch_standings(today: date) -> list:
@@ -376,6 +405,9 @@ def run():
 
             player_stats = fetch_player_stats(mid)
             upsert(conn, "player_stats", player_stats, ["match_id", "player_id"])
+
+            events = fetch_events(mid)
+            upsert(conn, "fixture_events", events, ["match_id", "elapsed", "elapsed_extra", "team_id", "player_id"])
 
         # 3. Standings (snapshot diario)
         standings = fetch_standings(today)
