@@ -71,7 +71,8 @@ def upsert(conn, table: str, rows: list, conflict_cols: list):
         log.info(f"  → {table}: sin filas para insertar")
         return
     cursor = conn.cursor()
-    cols        = list(rows[0].keys())
+    # Ignorar campos auxiliares (empiezan con _) — son solo para upsert_masters
+    cols        = [c for c in rows[0].keys() if not c.startswith("_")]
     update_cols = [c for c in cols if c not in conflict_cols + ["inserted_at"]]
     placeholders = ",".join(["%s"] * len(cols))
     col_names    = ",".join(cols)
@@ -86,6 +87,65 @@ def upsert(conn, table: str, rows: list, conflict_cols: list):
     psycopg2.extras.execute_batch(cursor, sql, values, page_size=100)
     conn.commit()
     log.info(f"  → {table}: {len(rows)} filas procesadas")
+
+
+def upsert_masters(conn, matches: list, lineups: list = None,
+                   player_stats: list = None, events: list = None):
+    """
+    Popula las tablas maestras teams y players antes de insertar
+    en las tablas transaccionales.
+    Los campos auxiliares (prefijo _) se usan solo aquí y se ignoran en upsert().
+    """
+    cursor = conn.cursor()
+
+    # ── Teams ──
+    teams = {}
+    for m in matches:
+        teams[m["home_team_id"]] = m.get("home_team_name") or m.get("_home_team_name")
+        teams[m["away_team_id"]] = m.get("away_team_name") or m.get("_away_team_name")
+
+    for rows in [lineups, player_stats, events]:
+        if rows:
+            for r in rows:
+                if r.get("team_id") and r.get("_team_name"):
+                    teams[r["team_id"]] = r["_team_name"]
+
+    if teams:
+        psycopg2.extras.execute_batch(cursor, """
+            INSERT INTO teams (team_id, team_name)
+            VALUES (%s, %s)
+            ON CONFLICT (team_id) DO NOTHING
+        """, [(tid, tname) for tid, tname in teams.items() if tname])
+
+    # ── Players ──
+    players = {}
+
+    if lineups:
+        for r in lineups:
+            if r.get("player_id") and r.get("player_name"):
+                players[r["player_id"]] = r["player_name"]
+
+    if player_stats:
+        for r in player_stats:
+            if r.get("player_id") and r.get("_player_name"):
+                players[r["player_id"]] = r["_player_name"]
+
+    if events:
+        for r in events:
+            if r.get("player_id") and r.get("_player_name"):
+                players[r["player_id"]] = r["_player_name"]
+            if r.get("assist_id") and r.get("_assist_name"):
+                players[r["assist_id"]] = r["_assist_name"]
+
+    if players:
+        psycopg2.extras.execute_batch(cursor, """
+            INSERT INTO players (player_id, player_name)
+            VALUES (%s, %s)
+            ON CONFLICT (player_id) DO NOTHING
+        """, [(pid, pname) for pid, pname in players.items() if pname])
+
+    conn.commit()
+    log.info(f"  → masters: {len(teams)} equipos, {len(players)} jugadores")
 
 
 # ── FETCH: MATCHES ───────────────────────────────────────────
@@ -152,7 +212,6 @@ def fetch_match_stats(match_id: int, home_id: int, home_name: str,
         rows.append({
             "match_id":         match_id,
             "team_id":          tid,
-            "team_name":        meta["name"],
             "is_home":          meta["is_home"],
             "possession_pct":   safe_float(stats.get("Ball Possession")),
             "passes_total":     safe_int(stats.get("Total passes")),
@@ -184,8 +243,8 @@ def fetch_lineups(match_id: int) -> list:
     rows = []
 
     for team_data in data.get("response", []):
-        tid      = team_data["team"]["id"]
-        tname    = team_data["team"]["name"]
+        tid       = team_data["team"]["id"]
+        tname     = team_data["team"]["name"]  # solo para upsert_masters
         formation = team_data.get("formation")
 
         for p in team_data.get("startXI", []):
@@ -194,14 +253,14 @@ def fetch_lineups(match_id: int) -> list:
             rows.append({
                 "match_id":      match_id,
                 "team_id":       tid,
-                "team_name":     tname,
                 "player_id":     pl["id"] if pl["id"] is not None else -(match_id * 10000 + (shirt or 99)),
-                "player_name":   pl["name"] or "Unknown",
+                "player_name":   pl["name"] or "Unknown",  # solo para upsert_masters
                 "shirt_number":  shirt,
                 "position":      pl.get("pos"),
                 "grid":          pl.get("grid"),
                 "formation":     formation,
                 "is_starter":    True,
+                "_team_name":    tname,  # campo auxiliar, no se inserta en DB
             })
 
         for p in team_data.get("substitutes", []):
@@ -210,14 +269,14 @@ def fetch_lineups(match_id: int) -> list:
             rows.append({
                 "match_id":      match_id,
                 "team_id":       tid,
-                "team_name":     tname,
                 "player_id":     pl["id"] if pl["id"] is not None else -(match_id * 10000 + (shirt or 99)),
-                "player_name":   pl["name"] or "Unknown",
+                "player_name":   pl["name"] or "Unknown",  # solo para upsert_masters
                 "shirt_number":  shirt,
                 "position":      pl.get("pos"),
                 "grid":          None,
                 "formation":     formation,
                 "is_starter":    False,
+                "_team_name":    tname,  # campo auxiliar, no se inserta en DB
             })
 
     return rows
@@ -250,9 +309,9 @@ def fetch_player_stats(match_id: int) -> list:
             rows.append({
                 "match_id":          match_id,
                 "team_id":           tid,
-                "team_name":         tname,
                 "player_id":         info["id"] if info["id"] is not None else -(match_id * 10000 + (shirt or 99)),
-                "player_name":       info["name"] or "Unknown",
+                "_player_name":      info["name"] or "Unknown",  # auxiliar para upsert_masters
+                "_team_name":        tname,                       # auxiliar para upsert_masters
                 "minutes_played":    sv("games.minutes", int, 0),
                 "position":          sv("games.position"),
                 "shirt_number":      shirt,
@@ -305,14 +364,14 @@ def fetch_events(match_id: int) -> list:
             "elapsed":       safe_int(ev["time"]["elapsed"]),
             "elapsed_extra": safe_int(ev["time"].get("extra")),
             "team_id":       ev["team"]["id"],
-            "team_name":     ev["team"]["name"],
             "player_id":     ev["player"]["id"],
-            "player_name":   ev["player"]["name"],
             "assist_id":     ev["assist"]["id"],
-            "assist_name":   ev["assist"]["name"],
             "event_type":    ev["type"],
             "detail":        ev["detail"],
             "comments":      ev.get("comments"),
+            "_team_name":    ev["team"]["name"],    # auxiliar para upsert_masters
+            "_player_name":  ev["player"]["name"],  # auxiliar para upsert_masters
+            "_assist_name":  ev["assist"]["name"],  # auxiliar para upsert_masters
         })
 
     return rows
@@ -333,7 +392,7 @@ def fetch_standings(today: date) -> list:
                     "group_name":    entry.get("group", "").replace("Group ", ""),
                     "rank":          entry["rank"],
                     "team_id":       team["id"],
-                    "team_name":     team["name"],
+                    "_team_name":    team["name"],  # auxiliar para upsert_masters
                     "played":        entry["all"]["played"],
                     "won":           entry["all"]["win"],
                     "drawn":         entry["all"]["draw"],
@@ -364,9 +423,9 @@ def fetch_top_scorers(today: date) -> list:
             "snapshot_date":    today.isoformat(),
             "rank":             rank,
             "player_id":        player["id"],
-            "player_name":      player["name"],
+            "_player_name":     player["name"],   # auxiliar para upsert_masters
             "team_id":          team.get("id"),
-            "team_name":        team.get("name"),
+            "_team_name":       team.get("name"), # auxiliar para upsert_masters
             "goals":            safe_int(stats.get("goals", {}).get("total"), 0),
             "assists":          safe_int(stats.get("goals", {}).get("assists"), 0),
             "penalties_scored": safe_int(stats.get("penalty", {}).get("scored"), 0),
@@ -480,22 +539,23 @@ def fetch_finished_matches_since(since: datetime) -> list:
             seen_ids.add(match_id)
 
             rows.append({
-                "match_id":       match_id,
-                "date":           match_dt_str,
-                "stage":          league["round"],
-                "group_name":     league["round"].replace("Group Stage - ", "")
-                                  if "Group Stage" in league.get("round", "") else None,
-                "home_team_id":   teams["home"]["id"],
-                "home_team_name": teams["home"]["name"],
-                "away_team_id":   teams["away"]["id"],
-                "away_team_name": teams["away"]["name"],
-                "home_score":     safe_int(goals.get("home")),
-                "away_score":     safe_int(goals.get("away")),
-                "home_ht_score":  safe_int(score["halftime"]["home"]),
-                "away_ht_score":  safe_int(score["halftime"]["away"]),
-                "status":         fixture["status"]["short"],
-                "venue":          fixture["venue"]["name"],
-                "referee":        fixture.get("referee"),
+                "match_id":        match_id,
+                "date":            match_dt_str,
+                "stage":           league["round"],
+                "group_name":      league["round"].replace("Group Stage - ", "")
+                                   if "Group Stage" in league.get("round", "") else None,
+                "home_team_id":    teams["home"]["id"],
+                "away_team_id":    teams["away"]["id"],
+                "home_score":      safe_int(goals.get("home")),
+                "away_score":      safe_int(goals.get("away")),
+                "home_ht_score":   safe_int(score["halftime"]["home"]),
+                "away_ht_score":   safe_int(score["halftime"]["away"]),
+                "status":          fixture["status"]["short"],
+                "venue":           fixture["venue"]["name"],
+                "referee":         fixture.get("referee"),
+                # Auxiliares para upsert_masters — no se insertan en matches
+                "_home_team_name": teams["home"]["name"],
+                "_away_team_name": teams["away"]["name"],
             })
 
         current += timedelta(days=1)
@@ -521,28 +581,43 @@ def run():
         matches = fetch_finished_matches_since(since)
 
         if matches:
-            upsert(conn, "matches", matches, ["match_id"])
+            # 3. Popular tablas maestras primero
+            # (teams y players deben existir antes de insertar FK)
+            all_lineups      = []
+            all_player_stats = []
+            all_events       = []
 
-            # 3. Por cada partido nuevo: stats, lineups, player stats, events
             for m in matches:
                 mid = m["match_id"]
-                log.info(f"Procesando {m['home_team_name']} vs {m['away_team_name']} (id: {mid})")
+                log.info(f"Fetching {m['_home_team_name']} vs {m['_away_team_name']} (id: {mid})")
+                all_lineups      += fetch_lineups(mid)
+                all_player_stats += fetch_player_stats(mid)
+                all_events       += fetch_events(mid)
+
+            upsert_masters(conn, matches,
+                           lineups=all_lineups,
+                           player_stats=all_player_stats,
+                           events=all_events)
+
+            # 4. Insertar matches (sin los campos auxiliares _)
+            upsert(conn, "matches", matches, ["match_id"])
+
+            # 5. Insertar datos transaccionales por partido
+            for m in matches:
+                mid = m["match_id"]
+                log.info(f"Procesando {m['_home_team_name']} vs {m['_away_team_name']} (id: {mid})")
 
                 stats = fetch_match_stats(
                     mid,
-                    m["home_team_id"], m["home_team_name"],
-                    m["away_team_id"], m["away_team_name"],
+                    m["home_team_id"], m["_home_team_name"],
+                    m["away_team_id"], m["_away_team_name"],
                 )
                 upsert(conn, "match_stats", stats, ["match_id", "team_id"])
 
-                lineups = fetch_lineups(mid)
-                upsert(conn, "lineups", lineups, ["match_id", "player_id"])
-
-                player_stats = fetch_player_stats(mid)
-                upsert(conn, "player_stats", player_stats, ["match_id", "player_id"])
-
-                events = fetch_events(mid)
-                upsert(conn, "fixture_events", events, ["match_id", "elapsed", "elapsed_extra", "team_id", "player_id"])
+            # Lineups, player_stats y events ya los tenemos — solo insertamos
+            upsert(conn, "lineups",         all_lineups,      ["match_id", "player_id"])
+            upsert(conn, "player_stats",    all_player_stats, ["match_id", "player_id"])
+            upsert(conn, "fixture_events",  all_events,       ["match_id", "elapsed", "elapsed_extra", "team_id", "player_id"])
 
             # El checkpoint nuevo es el timestamp del partido más reciente procesado
             last_match_dt = max(
@@ -555,9 +630,22 @@ def run():
 
         # 4. Standings y top scorers (snapshot diario, siempre)
         standings = fetch_standings(today)
-        upsert(conn, "standings", standings, ["snapshot_date", "team_id"])
-
         top_scorers = fetch_top_scorers(today)
+
+        # Popular masters con equipos y jugadores nuevos que aparezcan
+        upsert_masters(conn,
+                       matches=[],
+                       player_stats=top_scorers,
+                       events=[{
+                           "team_id": r["team_id"],
+                           "_team_name": r["_team_name"],
+                           "player_id": None,
+                           "_player_name": None,
+                           "assist_id": None,
+                           "_assist_name": None,
+                       } for r in standings if r.get("team_id")])
+
+        upsert(conn, "standings",   standings,   ["snapshot_date", "team_id"])
         upsert(conn, "top_scorers", top_scorers, ["snapshot_date", "player_id"])
 
         # 5. Guardar checkpoint exitoso
