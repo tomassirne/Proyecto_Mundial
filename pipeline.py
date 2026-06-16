@@ -648,9 +648,48 @@ def run():
         upsert(conn, "standings",   standings,   ["snapshot_date", "team_id"])
         upsert(conn, "top_scorers", top_scorers, ["snapshot_date", "player_id"])
 
-        # 5. Guardar checkpoint exitoso
+        # 5. Limpieza de la base de datos
+        cursor = conn.cursor()
+
+        # Limpieza 1: eliminar jugadores duplicados por nombre
+        # Cuando hay dos player_id para el mismo nombre, nos quedamos con el mayor
+        cursor.execute("""
+            DELETE FROM players
+            WHERE player_id NOT IN (
+                SELECT MAX(player_id)
+                FROM players
+                GROUP BY player_name
+            )
+        """)
+        deleted_players = cursor.rowcount
+        conn.commit()
+        log.info(f"  → players: {deleted_players} duplicados eliminados")
+
+        # Limpieza 2: eliminar snapshots de top_scorers anteriores al más reciente
+        cursor.execute("""
+            DELETE FROM top_scorers
+            WHERE snapshot_date < (
+                SELECT MAX(snapshot_date)
+                FROM top_scorers
+            )
+        """)
+        deleted_snapshots = cursor.rowcount
+        conn.commit()
+        log.info(f"  → top_scorers: {deleted_snapshots} snapshots anteriores eliminados")
+
+        # 6. Guardar checkpoint exitoso
         save_checkpoint(conn, last_match_dt, len(matches), "success")
         log.info(f"══ Pipeline completado · checkpoint guardado: {last_match_dt} ══")
+
+        # 7. Refrescar vistas materializadas
+        cursor = conn.cursor()
+        for view in ["mv_match_detail", "mv_team_dashboard", "mv_player_dashboard"]:
+            try:
+                cursor.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view}")
+                conn.commit()
+                log.info(f"  → {view}: refrescada")
+            except Exception as e:
+                log.warning(f"  → {view}: no se pudo refrescar ({e})")
 
     except Exception as e:
         log.error(f"Error en el pipeline: {e}")
