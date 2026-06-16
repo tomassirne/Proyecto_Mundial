@@ -652,7 +652,89 @@ def run():
         cursor = conn.cursor()
 
         # Limpieza 1: eliminar jugadores duplicados por nombre
-        # Cuando hay dos player_id para el mismo nombre, nos quedamos con el mayor
+        # Cuando hay dos player_id para el mismo nombre, nos quedamos con el mayor.
+        # Hay que eliminar primero las referencias en tablas hijas (FK cascade manual)
+        cursor.execute("""
+            WITH keep AS (
+                -- El player_id que vamos a conservar por cada nombre
+                SELECT MAX(player_id) AS keep_id
+                FROM players
+                GROUP BY player_name
+            ),
+            to_delete AS (
+                -- Los player_id que hay que eliminar
+                SELECT p.player_id
+                FROM players p
+                WHERE p.player_id NOT IN (SELECT keep_id FROM keep)
+            )
+            -- Primero actualizamos las tablas hijas para apuntar al ID correcto
+            UPDATE lineups
+            SET player_id = (
+                SELECT MAX(p2.player_id)
+                FROM players p2
+                WHERE p2.player_name = (
+                    SELECT player_name FROM players WHERE player_id = lineups.player_id
+                )
+            )
+            WHERE player_id IN (SELECT player_id FROM to_delete)
+        """)
+        conn.commit()
+
+        cursor.execute("""
+            UPDATE player_stats
+            SET player_id = (
+                SELECT MAX(p2.player_id)
+                FROM players p2
+                WHERE p2.player_name = (
+                    SELECT player_name FROM players WHERE player_id = player_stats.player_id
+                )
+            )
+            WHERE player_id IN (
+                SELECT player_id FROM players
+                WHERE player_id NOT IN (
+                    SELECT MAX(player_id) FROM players GROUP BY player_name
+                )
+            )
+        """)
+        conn.commit()
+
+        cursor.execute("""
+            UPDATE fixture_events
+            SET player_id = (
+                SELECT MAX(p2.player_id)
+                FROM players p2
+                WHERE p2.player_name = (
+                    SELECT player_name FROM players WHERE player_id = fixture_events.player_id
+                )
+            )
+            WHERE player_id IN (
+                SELECT player_id FROM players
+                WHERE player_id NOT IN (
+                    SELECT MAX(player_id) FROM players GROUP BY player_name
+                )
+            )
+        """)
+        conn.commit()
+
+        cursor.execute("""
+            UPDATE fixture_events
+            SET assist_id = (
+                SELECT MAX(p2.player_id)
+                FROM players p2
+                WHERE p2.player_name = (
+                    SELECT player_name FROM players WHERE player_id = fixture_events.assist_id
+                )
+            )
+            WHERE assist_id IN (
+                SELECT player_id FROM players
+                WHERE player_id NOT IN (
+                    SELECT MAX(player_id) FROM players GROUP BY player_name
+                )
+            )
+        """)
+        conn.commit()
+
+        # Ahora sí podemos borrar los duplicados de players
         cursor.execute("""
             DELETE FROM players
             WHERE player_id NOT IN (
