@@ -190,13 +190,14 @@ def fetch_lineups(match_id: int) -> list:
 
         for p in team_data.get("startXI", []):
             pl = p["player"]
+            shirt = pl.get("number")
             rows.append({
                 "match_id":      match_id,
                 "team_id":       tid,
                 "team_name":     tname,
-                "player_id":     pl["id"],
-                "player_name":   pl["name"],
-                "shirt_number":  pl.get("number"),
+                "player_id":     pl["id"] if pl["id"] is not None else -(match_id * 10000 + (shirt or 99)),
+                "player_name":   pl["name"] or "Unknown",
+                "shirt_number":  shirt,
                 "position":      pl.get("pos"),
                 "grid":          pl.get("grid"),
                 "formation":     formation,
@@ -205,13 +206,14 @@ def fetch_lineups(match_id: int) -> list:
 
         for p in team_data.get("substitutes", []):
             pl = p["player"]
+            shirt = pl.get("number")
             rows.append({
                 "match_id":      match_id,
                 "team_id":       tid,
                 "team_name":     tname,
-                "player_id":     pl["id"],
-                "player_name":   pl["name"],
-                "shirt_number":  pl.get("number"),
+                "player_id":     pl["id"] if pl["id"] is not None else -(match_id * 10000 + (shirt or 99)),
+                "player_name":   pl["name"] or "Unknown",
+                "shirt_number":  shirt,
                 "position":      pl.get("pos"),
                 "grid":          None,
                 "formation":     formation,
@@ -244,15 +246,16 @@ def fetch_player_stats(match_id: int) -> list:
                 except (KeyError, TypeError, ValueError):
                     return default
 
+            shirt = sv("games.number", int)
             rows.append({
                 "match_id":          match_id,
                 "team_id":           tid,
                 "team_name":         tname,
-                "player_id":         info["id"],
-                "player_name":       info["name"],
+                "player_id":         info["id"] if info["id"] is not None else -(match_id * 10000 + (shirt or 99)),
+                "player_name":       info["name"] or "Unknown",
                 "minutes_played":    sv("games.minutes", int, 0),
                 "position":          sv("games.position"),
-                "shirt_number":      sv("games.number", int),
+                "shirt_number":      shirt,
                 "rating":            sv("games.rating", float),
                 "is_captain":        sv("games.captain", bool, False),
                 "is_substitute":     sv("games.substitute", bool, False),
@@ -282,6 +285,7 @@ def fetch_player_stats(match_id: int) -> list:
                 "penalty_saved":     sv("penalty.saved", int, 0),
             })
 
+    rows = [r for r in rows if r["player_id"] is not None]
     return rows
 
 
