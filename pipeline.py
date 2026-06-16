@@ -651,103 +651,65 @@ def run():
         # 5. Limpieza de la base de datos
         cursor = conn.cursor()
 
-        # Limpieza 1: eliminar jugadores duplicados por nombre
-        # Cuando hay dos player_id para el mismo nombre, nos quedamos con el mayor.
-        # Hay que eliminar primero las referencias en tablas hijas (FK cascade manual)
-        cursor.execute("""
-            WITH keep AS (
-                -- El player_id que vamos a conservar por cada nombre
-                SELECT MAX(player_id) AS keep_id
-                FROM players
-                GROUP BY player_name
-            ),
-            to_delete AS (
-                -- Los player_id que hay que eliminar
-                SELECT p.player_id
-                FROM players p
-                WHERE p.player_id NOT IN (SELECT keep_id FROM keep)
-            )
-            -- Primero actualizamos las tablas hijas para apuntar al ID correcto
-            UPDATE lineups
-            SET player_id = (
-                SELECT MAX(p2.player_id)
-                FROM players p2
-                WHERE p2.player_name = (
-                    SELECT player_name FROM players WHERE player_id = lineups.player_id
-                )
-            )
-            WHERE player_id IN (SELECT player_id FROM to_delete)
-        """)
+        # Limpieza 1: eliminar registros con player_id = 0 (dato inválido de la API)
+        cursor.execute("DELETE FROM fixture_events WHERE player_id = 0 OR assist_id = 0")
+        cursor.execute("DELETE FROM player_stats WHERE player_id = 0")
+        cursor.execute("DELETE FROM lineups WHERE player_id = 0")
+        cursor.execute("DELETE FROM players WHERE player_id = 0")
         conn.commit()
+        log.info("  → limpieza: registros con player_id=0 eliminados")
 
+        # Limpieza 2: consolidar jugadores con ID sintético (negativo) + ID real (positivo)
+        # Solo cuando existe exactamente un ID negativo Y uno positivo con el mismo nombre.
+        # Casos con dos IDs positivos (ej: dos jugadores distintos llamados Ederson) no se tocan.
         cursor.execute("""
-            UPDATE player_stats
-            SET player_id = (
-                SELECT MAX(p2.player_id)
-                FROM players p2
-                WHERE p2.player_name = (
-                    SELECT player_name FROM players WHERE player_id = player_stats.player_id
-                )
-            )
-            WHERE player_id IN (
-                SELECT player_id FROM players
-                WHERE player_id NOT IN (
-                    SELECT MAX(player_id) FROM players GROUP BY player_name
-                )
-            )
+            SELECT
+                neg.player_id  AS synthetic_id,
+                pos.player_id  AS real_id,
+                neg.player_name
+            FROM players neg
+            JOIN players pos ON neg.player_name = pos.player_name
+                             AND pos.player_id > 0
+            WHERE neg.player_id < 0
         """)
-        conn.commit()
+        synthetic_pairs = cursor.fetchall()
 
-        cursor.execute("""
-            UPDATE fixture_events
-            SET player_id = (
-                SELECT MAX(p2.player_id)
-                FROM players p2
-                WHERE p2.player_name = (
-                    SELECT player_name FROM players WHERE player_id = fixture_events.player_id
-                )
-            )
-            WHERE player_id IN (
-                SELECT player_id FROM players
-                WHERE player_id NOT IN (
-                    SELECT MAX(player_id) FROM players GROUP BY player_name
-                )
-            )
-        """)
-        conn.commit()
+        for synthetic_id, real_id, player_name in synthetic_pairs:
+            log.info(f"  Consolidando '{player_name}': {synthetic_id} → {real_id}")
 
-        cursor.execute("""
-            UPDATE fixture_events
-            SET assist_id = (
-                SELECT MAX(p2.player_id)
-                FROM players p2
-                WHERE p2.player_name = (
-                    SELECT player_name FROM players WHERE player_id = fixture_events.assist_id
-                )
-            )
-            WHERE assist_id IN (
-                SELECT player_id FROM players
-                WHERE player_id NOT IN (
-                    SELECT MAX(player_id) FROM players GROUP BY player_name
-                )
-            )
-        """)
-        conn.commit()
+            # Eliminar filas que ya tienen el real_id en el mismo partido
+            # (para evitar conflicto de unique constraint al redirigir)
+            for table, col in [("lineups", "player_id"),
+                                ("player_stats", "player_id"),
+                                ("fixture_events", "player_id"),
+                                ("fixture_events", "assist_id")]:
+                cursor.execute(f"""
+                    DELETE FROM {table} t1
+                    WHERE t1.{col} = %s
+                    AND EXISTS (
+                        SELECT 1 FROM {table} t2
+                        WHERE t2.match_id = t1.match_id
+                          AND t2.{col} = %s
+                    )
+                """, (synthetic_id, real_id))
 
-        # Ahora sí podemos borrar los duplicados de players
-        cursor.execute("""
-            DELETE FROM players
-            WHERE player_id NOT IN (
-                SELECT MAX(player_id)
-                FROM players
-                GROUP BY player_name
-            )
-        """)
-        deleted_players = cursor.rowcount
-        conn.commit()
-        log.info(f"  → players: {deleted_players} duplicados eliminados")
+            # Redirigir referencias restantes al ID real
+            cursor.execute("UPDATE lineups SET player_id = %s WHERE player_id = %s",
+                           (real_id, synthetic_id))
+            cursor.execute("UPDATE player_stats SET player_id = %s WHERE player_id = %s",
+                           (real_id, synthetic_id))
+            cursor.execute("UPDATE fixture_events SET player_id = %s WHERE player_id = %s",
+                           (real_id, synthetic_id))
+            cursor.execute("UPDATE fixture_events SET assist_id = %s WHERE assist_id = %s",
+                           (real_id, synthetic_id))
 
-        # Limpieza 2: eliminar snapshots de top_scorers anteriores al más reciente
+            # Borrar el ID sintético de players
+            cursor.execute("DELETE FROM players WHERE player_id = %s", (synthetic_id,))
+
+        conn.commit()
+        log.info(f"  → players: {len(synthetic_pairs)} IDs sintéticos consolidados")
+
+        # Limpieza 3: eliminar snapshots de top_scorers anteriores al más reciente
         cursor.execute("""
             DELETE FROM top_scorers
             WHERE snapshot_date < (
