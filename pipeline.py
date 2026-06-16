@@ -122,8 +122,8 @@ def upsert_masters(conn, matches: list, lineups: list = None,
 
     if lineups:
         for r in lineups:
-            if r.get("player_id") and r.get("player_name"):
-                players[r["player_id"]] = r["player_name"]
+            if r.get("player_id") and r.get("_player_name"):
+                players[r["player_id"]] = r["_player_name"]
 
     if player_stats:
         for r in player_stats:
@@ -254,13 +254,13 @@ def fetch_lineups(match_id: int) -> list:
                 "match_id":      match_id,
                 "team_id":       tid,
                 "player_id":     pl["id"] if pl["id"] is not None else -(match_id * 10000 + (shirt or 99)),
-                "player_name":   pl["name"] or "Unknown",  # solo para upsert_masters
+                "_player_name":  pl["name"] or "Unknown",  # auxiliar para upsert_masters
                 "shirt_number":  shirt,
                 "position":      pl.get("pos"),
                 "grid":          pl.get("grid"),
                 "formation":     formation,
                 "is_starter":    True,
-                "_team_name":    tname,  # campo auxiliar, no se inserta en DB
+                "_team_name":    tname,
             })
 
         for p in team_data.get("substitutes", []):
@@ -270,13 +270,13 @@ def fetch_lineups(match_id: int) -> list:
                 "match_id":      match_id,
                 "team_id":       tid,
                 "player_id":     pl["id"] if pl["id"] is not None else -(match_id * 10000 + (shirt or 99)),
-                "player_name":   pl["name"] or "Unknown",  # solo para upsert_masters
+                "_player_name":  pl["name"] or "Unknown",  # auxiliar para upsert_masters
                 "shirt_number":  shirt,
                 "position":      pl.get("pos"),
                 "grid":          None,
                 "formation":     formation,
                 "is_starter":    False,
-                "_team_name":    tname,  # campo auxiliar, no se inserta en DB
+                "_team_name":    tname,
             })
 
     return rows
