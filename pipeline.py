@@ -13,7 +13,7 @@ import logging
 import requests
 import psycopg2
 import psycopg2.extras
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -93,10 +93,11 @@ def upsert(conn, table: str, rows: list, conflict_cols: list):
 def fetch_finished_matches(target_date: date) -> list:
     """Partidos terminados en la fecha indicada (UTC)."""
     data = af_get("fixtures", {
-        "league":  LEAGUE_ID,
-        "season":  SEASON,
-        "date":    target_date.isoformat(),
-        "status":  "FT-AET-PEN",
+        "league":   LEAGUE_ID,
+        "season":   SEASON,
+        "date":     target_date.isoformat(),
+        "status":   "FT-AET-PEN",
+        "timezone": "America/Argentina/Buenos_Aires",
     })
     rows = []
     for f in data.get("response", []):
@@ -375,52 +376,196 @@ def fetch_top_scorers(today: date) -> list:
 
 # ── MAIN ─────────────────────────────────────────────────────
 
+def process_matches(conn, matches: list):
+    """Procesa stats, lineups, player stats y eventos para una lista de partidos."""
+    for m in matches:
+        mid = m["match_id"]
+        log.info(f"Procesando {m['home_team_name']} vs {m['away_team_name']} (id: {mid})")
+
+        stats = fetch_match_stats(
+            mid,
+            m["home_team_id"], m["home_team_name"],
+            m["away_team_id"], m["away_team_name"],
+        )
+        upsert(conn, "match_stats", stats, ["match_id", "team_id"])
+
+        lineups = fetch_lineups(mid)
+        upsert(conn, "lineups", lineups, ["match_id", "player_id"])
+
+        player_stats = fetch_player_stats(mid)
+        upsert(conn, "player_stats", player_stats, ["match_id", "player_id"])
+
+        events = fetch_events(mid)
+        upsert(conn, "fixture_events", events, ["match_id", "elapsed", "elapsed_extra", "team_id", "player_id"])
+
+
+# ── CHECKPOINT ───────────────────────────────────────────────
+
+def get_checkpoint(conn) -> datetime:
+    """
+    Lee el timestamp del último partido procesado desde pipeline_control.
+    Devuelve un datetime UTC.
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT last_match_at
+        FROM pipeline_control
+        WHERE status = 'success'
+        ORDER BY id DESC
+        LIMIT 1
+    """)
+    row = cursor.fetchone()
+    if row and row[0]:
+        return row[0]
+    # Fallback: inicio del Mundial
+    return datetime(2026, 6, 11, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def save_checkpoint(conn, last_match_at, matches_found: int, status: str, error_msg: str = None):
+    """Guarda el resultado de la corrida en pipeline_control."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO pipeline_control (last_run_at, last_match_at, matches_found, status, error_msg)
+        VALUES (NOW(), %s, %s, %s, %s)
+    """, (last_match_at, matches_found, status, error_msg))
+    conn.commit()
+
+
+def fetch_finished_matches_since(since: datetime) -> list:
+    """
+    Obtiene todos los partidos terminados desde `since` hasta ahora.
+    Itera por fecha para no perder partidos que cruzaron la medianoche UTC.
+    El parámetro `since` es un datetime UTC con timezone info.
+    """
+    from datetime import timezone as tz
+
+    now_utc  = datetime.now(tz.utc)
+    rows     = []
+    seen_ids = set()
+
+    # Generamos todas las fechas UTC entre since y hoy inclusive
+    current = since.date()
+    end     = now_utc.date()
+
+    while current <= end:
+        data = af_get("fixtures", {
+            "league":  LEAGUE_ID,
+            "season":  SEASON,
+            "date":    current.isoformat(),
+            "status":  "FT-AET-PEN",
+        })
+
+        for f in data.get("response", []):
+            fixture    = f["fixture"]
+            teams      = f["teams"]
+            goals      = f["goals"]
+            score      = f["score"]
+            league     = f["league"]
+            match_id   = fixture["id"]
+
+            # Parseamos la fecha del partido para filtrar por timestamp exacto
+            match_dt_str = fixture["date"]  # ISO 8601 con offset, ej: "2026-06-17T01:00:00+00:00"
+            match_dt = datetime.fromisoformat(match_dt_str)
+
+            # Solo partidos que terminaron DESPUÉS del último checkpoint
+            if match_dt <= since:
+                continue
+
+            if match_id in seen_ids:
+                continue
+            seen_ids.add(match_id)
+
+            rows.append({
+                "match_id":       match_id,
+                "date":           match_dt_str,
+                "stage":          league["round"],
+                "group_name":     league["round"].replace("Group Stage - ", "")
+                                  if "Group Stage" in league.get("round", "") else None,
+                "home_team_id":   teams["home"]["id"],
+                "home_team_name": teams["home"]["name"],
+                "away_team_id":   teams["away"]["id"],
+                "away_team_name": teams["away"]["name"],
+                "home_score":     safe_int(goals.get("home")),
+                "away_score":     safe_int(goals.get("away")),
+                "home_ht_score":  safe_int(score["halftime"]["home"]),
+                "away_ht_score":  safe_int(score["halftime"]["away"]),
+                "status":         fixture["status"]["short"],
+                "venue":          fixture["venue"]["name"],
+                "referee":        fixture.get("referee"),
+            })
+
+        current += timedelta(days=1)
+
+    log.info(f"Partidos nuevos desde {since}: {len(rows)}")
+    return rows
+
+
+# ── MAIN ─────────────────────────────────────────────────────
+
 def run():
-    today       = date.today()
-    target_date = today - timedelta(days=1)
+    from datetime import timezone as tz
 
-    log.info(f"══ Pipeline Mundial 2026 · procesando {target_date} ══")
+    today = date.today()
+    conn  = get_conn()
 
-    conn = get_conn()
     try:
-        # 1. Partidos terminados ayer
-        matches = fetch_finished_matches(target_date)
+        # 1. Leer checkpoint: ¿hasta qué momento procesamos la última vez?
+        since = get_checkpoint(conn)
+        log.info(f"══ Pipeline Mundial 2026 · desde {since} ══")
+
+        # 2. Traer partidos terminados desde el checkpoint hasta ahora
+        matches = fetch_finished_matches_since(since)
+
         if matches:
             upsert(conn, "matches", matches, ["match_id"])
 
-        # 2. Por cada partido: stats, lineups, player stats
-        for m in matches:
-            mid = m["match_id"]
-            log.info(f"Procesando {m['home_team_name']} vs {m['away_team_name']} (id: {mid})")
+            # 3. Por cada partido nuevo: stats, lineups, player stats, events
+            for m in matches:
+                mid = m["match_id"]
+                log.info(f"Procesando {m['home_team_name']} vs {m['away_team_name']} (id: {mid})")
 
-            stats = fetch_match_stats(
-                mid,
-                m["home_team_id"], m["home_team_name"],
-                m["away_team_id"], m["away_team_name"],
+                stats = fetch_match_stats(
+                    mid,
+                    m["home_team_id"], m["home_team_name"],
+                    m["away_team_id"], m["away_team_name"],
+                )
+                upsert(conn, "match_stats", stats, ["match_id", "team_id"])
+
+                lineups = fetch_lineups(mid)
+                upsert(conn, "lineups", lineups, ["match_id", "player_id"])
+
+                player_stats = fetch_player_stats(mid)
+                upsert(conn, "player_stats", player_stats, ["match_id", "player_id"])
+
+                events = fetch_events(mid)
+                upsert(conn, "fixture_events", events, ["match_id", "elapsed", "elapsed_extra", "team_id", "player_id"])
+
+            # El checkpoint nuevo es el timestamp del partido más reciente procesado
+            last_match_dt = max(
+                datetime.fromisoformat(m["date"])
+                for m in matches
             )
-            upsert(conn, "match_stats", stats, ["match_id", "team_id"])
+        else:
+            # Sin partidos nuevos: el checkpoint queda igual que antes
+            last_match_dt = since
 
-            lineups = fetch_lineups(mid)
-            upsert(conn, "lineups", lineups, ["match_id", "player_id"])
-
-            player_stats = fetch_player_stats(mid)
-            upsert(conn, "player_stats", player_stats, ["match_id", "player_id"])
-
-            events = fetch_events(mid)
-            upsert(conn, "fixture_events", events, ["match_id", "elapsed", "elapsed_extra", "team_id", "player_id"])
-
-        # 3. Standings (snapshot diario)
+        # 4. Standings y top scorers (snapshot diario, siempre)
         standings = fetch_standings(today)
         upsert(conn, "standings", standings, ["snapshot_date", "team_id"])
 
-        # 4. Top scorers (snapshot diario)
         top_scorers = fetch_top_scorers(today)
         upsert(conn, "top_scorers", top_scorers, ["snapshot_date", "player_id"])
 
-        log.info("══ Pipeline completado sin errores ══")
+        # 5. Guardar checkpoint exitoso
+        save_checkpoint(conn, last_match_dt, len(matches), "success")
+        log.info(f"══ Pipeline completado · checkpoint guardado: {last_match_dt} ══")
 
     except Exception as e:
         log.error(f"Error en el pipeline: {e}")
+        try:
+            save_checkpoint(conn, None, 0, "error", str(e))
+        except Exception:
+            pass
         raise
     finally:
         conn.close()
