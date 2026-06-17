@@ -279,6 +279,8 @@ def fetch_lineups(match_id: int) -> list:
                 "_team_name":    tname,
             })
 
+    # Excluir filas con player_id inválido (None o 0)
+    rows = [r for r in rows if r.get("player_id") not in (None, 0)]
     return rows
 
 
@@ -344,7 +346,7 @@ def fetch_player_stats(match_id: int) -> list:
                 "penalty_saved":     sv("penalty.saved", int, 0),
             })
 
-    rows = [r for r in rows if r["player_id"] is not None]
+    rows = [r for r in rows if r["player_id"] is not None and r["player_id"] != 0]
     return rows
 
 
@@ -374,6 +376,8 @@ def fetch_events(match_id: int) -> list:
             "_assist_name":  ev["assist"]["name"],  # auxiliar para upsert_masters
         })
 
+    # Excluir eventos con player_id inválido
+    rows = [r for r in rows if r.get("player_id") not in (None, 0)]
     return rows
 
 
